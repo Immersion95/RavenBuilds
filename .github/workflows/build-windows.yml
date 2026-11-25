@@ -45,6 +45,27 @@ jobs:
           git -C eden submodule update --init --recursive
           git -C eden log -1 --oneline
 
+      - name: Install LLVM 22.1.8
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = '22.1.8'
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "llvm-$version"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $expectedHash = '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $expectedHash) { throw 'LLVM installer SHA256 mismatch.' }
+          $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$llvmRoot" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installation failed: $($process.ExitCode)" }
+          $llvmBin = Join-Path $llvmRoot 'bin'
+          foreach ($tool in @('clang-cl.exe', 'clang-scan-deps.exe', 'lld-link.exe')) {
+            if (!(Test-Path (Join-Path $llvmBin $tool))) { throw "LLVM tool not found: $tool" }
+          }
+          "LLVM_BIN=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Remove-Item $installer
+
       - name: Install CMake and Ninja
         run: |
           $ErrorActionPreference = 'Stop'
@@ -73,13 +94,25 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           . .\tools\windows\load-msvc-env.ps1
-          clang-cl --version
+          # Restore the pinned LLVM path after loading the Visual Studio environment.
+          $env:Path = "$env:LLVM_BIN;$env:Path"
+          $clang = Join-Path $env:LLVM_BIN 'clang-cl.exe'
+          $versionOutput = (& $clang --version) -join "`n"
+          Write-Host $versionOutput
+          if ($versionOutput -notmatch 'clang version 22\.1\.8(?:\s|$)') { throw 'Unexpected Clang version.' }
+          # Check the MSVC standard library before configuring the full project.
+          $probe = Join-Path $env:RUNNER_TEMP 'llvm-stl-check.cpp'
+          @'
+          #include <vector>
+          int main() { std::vector<int> v{0}; return v[0]; }
+          '@ | Set-Content -Encoding ascii $probe
+          & $clang /nologo /std:c++20 /c $probe "/Fo$env:RUNNER_TEMP\llvm-stl-check.obj"
           cmake --version
           ninja --version
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DYUZU_USE_BUNDLED_QT=ON -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF -DDYNARMIC_TESTS=OFF
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=$clang" "-DCMAKE_CXX_COMPILER=$clang" -DYUZU_USE_BUNDLED_QT=ON -DBUILD_TESTING=OFF -DYUZU_TESTS=OFF -DDYNARMIC_TESTS=OFF
           cmake --build build --parallel 2
           if (!(Test-Path 'build/bin/eden.exe')) { throw 'eden.exe was not produced.' }
-          @("Source repository: https://git.eden-emu.dev/Immersion95/eden", "Source commit: $(git rev-parse HEAD)", 'Target: Windows x64 Release', 'Compiler: clang-cl') | Set-Content -Encoding utf8 build/bin/BUILD_INFO.txt
+          @("Source repository: https://git.eden-emu.dev/Immersion95/eden", "Source commit: $(git rev-parse HEAD)", 'Target: Windows x64 Release', 'Compiler: clang-cl 22.1.8') | Set-Content -Encoding utf8 build/bin/BUILD_INFO.txt
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
